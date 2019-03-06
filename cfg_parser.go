@@ -84,6 +84,7 @@ const (
 	rollingFileArchiveAttr           = "archivetype"
 	rollingFileArchivePathAttr       = "archivepath"
 	rollingFileArchiveExplodedAttr   = "archiveexploded"
+	rollingFileArchiveTotalSizeAttr  = "archivetotalsize"
 	rollingFileFullNameAttr          = "fullname"
 	bufferedWriterID                 = "buffered"
 	bufferedSizeAttr                 = "size"
@@ -1060,10 +1061,20 @@ func createRollingFileWriter(node *xmlNode, formatFromParent *formatter, formats
 		}
 	}
 
+	archiveTotalSizeStr, ok := node.attributes[rollingFileArchiveTotalSizeAttr]
+	var archiveTotalSize int64
+	archiveTotalSize = 0
+	if ok {
+		archiveTotalSize, err = strconv.ParseInt(archiveTotalSizeStr, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if rollingType == rollingTypeSize {
 		err := checkUnexpectedAttribute(node, outputFormatID, rollingFileTypeAttr, rollingFilePathAttr,
 			rollingFileMaxSizeAttr, rollingFileMaxRollsAttr, rollingFileArchiveAttr,
-			rollingFileArchivePathAttr, rollingFileArchiveExplodedAttr, rollingFileNameModeAttr)
+			rollingFileArchivePathAttr, rollingFileArchiveExplodedAttr, rollingFileArchiveTotalSizeAttr, rollingFileNameModeAttr)
 		if err != nil {
 			return nil, err
 		}
@@ -1087,7 +1098,7 @@ func createRollingFileWriter(node *xmlNode, formatFromParent *formatter, formats
 			}
 		}
 
-		rollingWriter, err := NewRollingFileWriterSize(path, rArchiveType, rArchivePath, maxSize, maxRolls, nameMode, rArchiveExploded)
+		rollingWriter, err := NewRollingFileWriterSize(path, rArchiveType, rArchivePath, maxSize, maxRolls, nameMode, rArchiveExploded, archiveTotalSize)
 		if err != nil {
 			return nil, err
 		}
@@ -1097,7 +1108,7 @@ func createRollingFileWriter(node *xmlNode, formatFromParent *formatter, formats
 	} else if rollingType == rollingTypeTime {
 		err := checkUnexpectedAttribute(node, outputFormatID, rollingFileTypeAttr, rollingFilePathAttr,
 			rollingFileDataPatternAttr, rollingFileArchiveAttr, rollingFileMaxRollsAttr,
-			rollingFileArchivePathAttr, rollingFileArchiveExplodedAttr, rollingFileNameModeAttr,
+			rollingFileArchivePathAttr, rollingFileArchiveExplodedAttr, rollingFileArchiveTotalSizeAttr, rollingFileNameModeAttr,
 			rollingFileFullNameAttr)
 		if err != nil {
 			return nil, err
@@ -1129,7 +1140,7 @@ func createRollingFileWriter(node *xmlNode, formatFromParent *formatter, formats
 			return nil, newMissingArgumentError(node.name, rollingFileDataPatternAttr)
 		}
 
-		rollingWriter, err := NewRollingFileWriterTime(path, rArchiveType, rArchivePath, maxRolls, dataPattern, nameMode, rArchiveExploded, fullName)
+		rollingWriter, err := NewRollingFileWriterTime(path, rArchiveType, rArchivePath, maxRolls, dataPattern, nameMode, rArchiveExploded, archiveTotalSize, fullName)
 		if err != nil {
 			return nil, err
 		}

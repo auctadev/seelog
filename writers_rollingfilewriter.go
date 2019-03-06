@@ -173,7 +173,50 @@ var compressionTypes = map[rollingArchiveType]compressionType{
 	},
 }
 
-func (compressionType *compressionType) rollingArchiveTypeName(name string, exploded bool) string {
+func getFileID(fullName string, latestIndex int) string {
+	split := strings.Split(fullName, rollingLogHistoryDelimiter)
+	name := ""
+	for i := 0; i < len(split)-latestIndex; i++ {
+		name = name + split[i]
+	}
+	return name
+}
+
+func getRolledFileID(mode rollingNameMode, rolledFullName string) string {
+	switch mode {
+	case rollingNameModePostfix:
+		return getFileID(rolledFullName, 2)
+	case rollingNameModePrefix:
+		split := strings.Split(rolledFullName, rollingLogHistoryDelimiter)
+		name := ""
+		for i := 1; i < len(split); i++ {
+			name = name + rollingLogHistoryDelimiter + split[i]
+		}
+		return getLogFileID(name)
+	}
+	return ""
+}
+
+func getLogFileID(fullName string) string {
+	return getFileID(fullName, 1)
+}
+
+func (compressionType *compressionType) rollingArchiveTypeName(name string, exploded bool, rw *rollingFileWriter) string {
+	currentDate := time.Now().Format("2006-02-01")
+	num, _ := strconv.Atoi(rw.getFileRollName(name))
+	if rw != nil {
+		logId := getRolledFileID(rw.nameMode, name)
+		switch rw.nameMode {
+		case rollingNameModePostfix:
+			//default.log.2
+			//<date>-<number>.<compression>
+			name = fmt.Sprintf("%s-%s-%d", logId, currentDate, num)
+		case rollingNameModePrefix:
+			//1.default.log
+			//<number>-default-<date>.<compression>
+			name = fmt.Sprintf("%d-%s-%s", num, logId, currentDate)
+		}
+	}
 	if !compressionType.handleMultipleEntries && !exploded {
 		return name + ".tar" + compressionType.extension
 	} else {
@@ -200,7 +243,7 @@ func rollingArchiveTypeDefaultName(archiveType rollingArchiveType, exploded bool
 	if !ok {
 		return "", fmt.Errorf("cannot get default filename for archive type = %v", archiveType)
 	}
-	return compressionType.rollingArchiveTypeName("log", exploded), nil
+	return compressionType.rollingArchiveTypeName("log", exploded, nil), nil
 }
 
 // rollerVirtual is an interface that represents all virtual funcs that are
@@ -224,24 +267,25 @@ type rollerVirtual interface {
 // files count, if you want, and then the rolling writer would delete older ones when
 // the files count exceed the specified limit.
 type rollingFileWriter struct {
-	fileName        string // log file name
-	currentDirPath  string
-	currentFile     *os.File
-	currentName     string
-	currentFileSize int64
-	rollingType     rollingType // Rolling mode (Files roll by size/date/...)
-	archiveType     rollingArchiveType
-	archivePath     string
-	archiveExploded bool
-	fullName        bool
-	maxRolls        int
-	nameMode        rollingNameMode
-	self            rollerVirtual // Used for virtual calls
-	rollLock        sync.Mutex
+	fileName         string // log file name
+	currentDirPath   string
+	currentFile      *os.File
+	currentName      string
+	currentFileSize  int64
+	rollingType      rollingType // Rolling mode (Files roll by size/date/...)
+	archiveType      rollingArchiveType
+	archivePath      string
+	archiveExploded  bool
+	archiveTotalSize int64
+	fullName         bool
+	maxRolls         int
+	nameMode         rollingNameMode
+	self             rollerVirtual // Used for virtual calls
+	rollLock         sync.Mutex
 }
 
 func newRollingFileWriter(fpath string, rtype rollingType, atype rollingArchiveType, apath string, maxr int, namemode rollingNameMode,
-	archiveExploded bool, fullName bool) (*rollingFileWriter, error) {
+	archiveExploded bool, archivedTotalSize int64, fullName bool) (*rollingFileWriter, error) {
 	rw := new(rollingFileWriter)
 	rw.currentDirPath, rw.fileName = filepath.Split(fpath)
 	if len(rw.currentDirPath) == 0 {
@@ -254,6 +298,7 @@ func newRollingFileWriter(fpath string, rtype rollingType, atype rollingArchiveT
 	rw.nameMode = namemode
 	rw.maxRolls = maxr
 	rw.archiveExploded = archiveExploded
+	rw.archiveTotalSize = archivedTotalSize
 	rw.fullName = fullName
 	return rw, nil
 }
@@ -278,6 +323,43 @@ func (rw *rollingFileWriter) createFullFileName(originalName, rollname string) s
 		return rollname + rollingLogHistoryDelimiter + originalName
 	}
 	return ""
+}
+
+func (rw *rollingFileWriter) getSortedArchivedFilesDetails() ([]string, []int64, int64, error) {
+	//Get all compressed files on archived that match with the log file id
+	fileID := getLogFileID(rw.fileName)
+	files, err := getDirFilePaths(
+		rw.archivePath,
+		func(file string) bool {
+			return strings.Contains(file, fileID)
+		},
+		true)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		numI, _ := strconv.Atoi(rw.getArchivedFileRollName(files[i]))
+		numJ, _ := strconv.Atoi(rw.getArchivedFileRollName(files[j]))
+		return numI < numJ
+	})
+
+	filesPaths := make([]string, 0)
+	filesSizes := make([]int64, 0)
+	var totalSize int64
+	totalSize = 0
+	for _, archivedFileName := range files {
+		archivedFile := filepath.Join(rw.archivePath, archivedFileName)
+		fi, err := os.Stat(archivedFile)
+		if err != nil {
+			continue
+		}
+		fileSize := fi.Size()
+		filesPaths = append(filesPaths, archivedFile)
+		filesSizes = append(filesSizes, fileSize)
+		totalSize = totalSize + fileSize
+	}
+	return filesPaths, filesSizes, totalSize, nil
 }
 
 func (rw *rollingFileWriter) getSortedLogHistory() ([]string, error) {
@@ -365,7 +447,7 @@ func (rw *rollingFileWriter) archiveExplodedLogs(logFilename string, compression
 
 		// Finalize archive by swapping the buffered archive into place
 		err = os.Rename(dst.Name(), filepath.Join(rw.archivePath,
-			compressionType.rollingArchiveTypeName(logFilename, true)))
+			compressionType.rollingArchiveTypeName(logFilename, true, rw)))
 	}()
 
 	// archive entry
@@ -470,6 +552,29 @@ func (rw *rollingFileWriter) deleteOldRolls(history []string) error {
 			for i := 0; i < rollsToDelete; i++ {
 				rw.archiveExplodedLogs(history[i], compressionTypes[rw.archiveType])
 			}
+
+			// Check if archived exceeded the limits and remove olders if not
+			totalSize := rw.archiveTotalSize
+			if totalSize > 0 {
+				filesPaths, filesSizes, totalSize, err := rw.getSortedArchivedFilesDetails()
+				if err != nil {
+					return err
+				}
+				toRemove := make([]string, 0)
+				for i, path := range filesPaths {
+					if totalSize <= rw.archiveTotalSize {
+						break
+					}
+					toRemove = append(toRemove, path)
+					totalSize = totalSize - filesSizes[i]
+				}
+				for _, file := range toRemove {
+					if err = tryRemoveFile(file); err != nil {
+						reportInternalError(err)
+					}
+				}
+			}
+
 		} else {
 			os.MkdirAll(filepath.Dir(rw.archivePath), defaultDirectoryPermissions)
 
@@ -487,6 +592,20 @@ func (rw *rollingFileWriter) deleteOldRolls(history []string) error {
 	}
 
 	return nil
+}
+
+func (rw *rollingFileWriter) getArchivedFileRollName(fileName string) string {
+	switch rw.nameMode {
+	case rollingNameModePostfix:
+		//default-2019-03-01-2.gz => 2
+		fileNoExtension := strings.Split(fileName, rollingLogHistoryDelimiter)[0]
+		ss := strings.Split(fileNoExtension, "-")
+		return ss[len(ss)-1]
+	case rollingNameModePrefix:
+		//1-default-2019-03-01.gz => 1
+		return strings.Split(fileName, "-")[0]
+	}
+	return ""
 }
 
 func (rw *rollingFileWriter) getFileRollName(fileName string) string {
@@ -608,8 +727,8 @@ type rollingFileWriterSize struct {
 	maxFileSize int64
 }
 
-func NewRollingFileWriterSize(fpath string, atype rollingArchiveType, apath string, maxSize int64, maxRolls int, namemode rollingNameMode, archiveExploded bool) (*rollingFileWriterSize, error) {
-	rw, err := newRollingFileWriter(fpath, rollingTypeSize, atype, apath, maxRolls, namemode, archiveExploded, false)
+func NewRollingFileWriterSize(fpath string, atype rollingArchiveType, apath string, maxSize int64, maxRolls int, namemode rollingNameMode, archiveExploded bool, archiveMaxSize int64) (*rollingFileWriterSize, error) {
+	rw, err := newRollingFileWriter(fpath, rollingTypeSize, atype, apath, maxRolls, namemode, archiveExploded, archiveMaxSize, false)
 	if err != nil {
 		return nil, err
 	}
@@ -684,9 +803,9 @@ type rollingFileWriterTime struct {
 }
 
 func NewRollingFileWriterTime(fpath string, atype rollingArchiveType, apath string, maxr int,
-	timePattern string, namemode rollingNameMode, archiveExploded bool, fullName bool) (*rollingFileWriterTime, error) {
+	timePattern string, namemode rollingNameMode, archiveExploded bool, archiveMaxSize int64, fullName bool) (*rollingFileWriterTime, error) {
 
-	rw, err := newRollingFileWriter(fpath, rollingTypeTime, atype, apath, maxr, namemode, archiveExploded, fullName)
+	rw, err := newRollingFileWriter(fpath, rollingTypeTime, atype, apath, maxr, namemode, archiveExploded, archiveMaxSize, fullName)
 	if err != nil {
 		return nil, err
 	}
